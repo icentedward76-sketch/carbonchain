@@ -129,4 +129,10 @@ pub enum DataKey {
     /// Maintained by submit_credit (add) and approve_and_mint/flag_credit (remove).
     /// Used by remove_verifier to iterate per-credit snapshots efficiently.
     PendingCredits,
+    /// Total number of credits ever submitted. Incremented once per
+    /// `submit_credit` call, never decremented — retired/expired/flagged
+    /// credits still count toward this total. Lets callers (e.g. the API)
+    /// read a total count in O(1) instead of fetching and counting every
+    /// credit ID in-process.
+    TotalCredits,
 }

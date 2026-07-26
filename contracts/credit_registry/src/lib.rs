@@ -41,12 +41,13 @@ use crate::storage::{
     get_credit_approvals, get_credit_by_project_vintage, get_credits_by_owner,
     get_credits_by_project, get_issuers, get_methodologies, get_nonce, get_pending_credits,
     get_required_approvals, get_retirement_contract, get_session, get_session_op_count,
-    get_verifier_pending_count, get_verifier_reputation, get_verifiers, has_admin,
-    increment_approval_count, increment_dispute_count, increment_session_op_count,
-    increment_verifier_pending, is_issuer as storage_is_issuer, is_methodology_valid, is_paused,
-    is_verifier, remove_credit_approvals, remove_credit_from_owner, set_admin, set_credit,
-    set_credit_approvals, set_credit_by_project_vintage, set_issuers, set_methodologies,
-    set_paused, set_required_approvals, set_retirement_contract, set_session, set_verifiers,
+    get_total_credits, get_verifier_pending_count, get_verifier_reputation, get_verifiers,
+    has_admin, increment_approval_count, increment_dispute_count, increment_session_op_count,
+    increment_total_credits, increment_verifier_pending, is_issuer as storage_is_issuer,
+    is_methodology_valid, is_paused, is_verifier, remove_credit_approvals,
+    remove_credit_from_owner, set_admin, set_credit, set_credit_approvals,
+    set_credit_by_project_vintage, set_issuers, set_methodologies, set_paused,
+    set_required_approvals, set_retirement_contract, set_session, set_verifiers,
     get_verifier_services_for, set_verifier_services, verifier_has_credit_approval,
 };
 use crate::types::{
@@ -452,6 +453,8 @@ impl CreditRegistry {
         set_credit_by_project_vintage(&env, &project_id, vintage_year, &id);
         add_credit_to_project(&env, &project_id, &id);
         add_credit_to_owner(&env, &issuer, &id);
+        // Issue #541: track total credits ever issued for O(1) count reads.
+        increment_total_credits(&env);
 
         // Issue #481: snapshot the current verifier set for THIS credit so that
         // remove_verifier can accurately check per-credit assignment rather than
@@ -778,6 +781,49 @@ impl CreditRegistry {
             }
         }
         owned
+    }
+
+    /// Returns the total number of credits ever submitted via `submit_credit`.
+    /// Never decrements — retired/expired/flagged credits still count toward
+    /// this total. Lets callers read a total in O(1) instead of fetching and
+    /// counting every credit ID off-chain.
+    pub fn get_credit_count(env: Env) -> u64 {
+        get_total_credits(&env)
+    }
+
+    /// Returns one page of credit IDs currently owned by `owner`. `offset` is
+    /// 0-indexed into the owner's *current* (stale-filtered) credit list;
+    /// `limit` is capped at 100 per call.
+    ///
+    /// Equivalent to `list_credits_by_owner(owner)[offset..offset+limit]`, but
+    /// callers that only need one page avoid transferring the owner's full
+    /// credit list over the wire.
+    pub fn get_credits_by_owner_paginated(
+        env: Env,
+        owner: Address,
+        offset: u32,
+        limit: u32,
+    ) -> Vec<BytesN<32>> {
+        let limit = if limit == 0 || limit > 100 { 100 } else { limit };
+        let all = get_credits_by_owner(&env, &owner);
+
+        let mut owned: Vec<BytesN<32>> = Vec::new(&env);
+        for id in all.iter() {
+            if let Some(credit) = get_credit(&env, &id) {
+                if credit.owner == owner {
+                    owned.push_back(id);
+                }
+            }
+        }
+
+        let mut page: Vec<BytesN<32>> = Vec::new(&env);
+        let mut i = offset;
+        let end = offset.saturating_add(limit);
+        while i < end && i < owned.len() {
+            page.push_back(owned.get(i).unwrap());
+            i += 1;
+        }
+        page
     }
 
     /// Returns the current replay-protection nonce for `address`.
@@ -1487,6 +1533,128 @@ mod tests {
         assert_eq!(p1.get(0).unwrap(), addrs.get(2).unwrap());
         let p2 = client.list_verifiers_paginated(&2, &2);
         assert_eq!(p2.len(), 1);
+    }
+
+    // ── Issue #541: get_credit_count / get_credits_by_owner_paginated ────────
+
+    #[test]
+    fn test_get_credit_count_increments_and_never_decrements() {
+        let (env, client, admin, verifier) = setup();
+        assert_eq!(client.get_credit_count(), 0);
+
+        let issuer = Address::generate(&env);
+        client.register_issuer(&admin, &issuer, &client.get_nonce(&admin));
+        client.register_methodology(
+            &admin,
+            &String::from_str(&env, "VCS"),
+            &String::from_str(&env, "Verified Carbon Standard"),
+            &client.get_nonce(&admin),
+        );
+        client.register_project(
+            &admin,
+            &String::from_str(&env, "PROJ-COUNT"),
+            &String::from_str(&env, "Test Project"),
+            &String::from_str(&env, "A test project"),
+            &String::from_str(&env, "NG"),
+        );
+
+        let mut ids = soroban_sdk::Vec::new(&env);
+        for year in 2020u32..2023u32 {
+            let nonce = client.get_nonce(&issuer);
+            let id = client.submit_credit(
+                &issuer,
+                &String::from_str(&env, "PROJ-COUNT"),
+                &year,
+                &String::from_str(&env, "VCS"),
+                &String::from_str(&env, "NG"),
+                &1_000_000,
+                &String::from_str(&env, "bafybei123"),
+                &nonce,
+            );
+            ids.push_back(id);
+        }
+        assert_eq!(client.get_credit_count(), 3);
+
+        // Retiring/flagging a credit must not decrement the total.
+        client.register_verifier(&admin, &verifier, &client.get_nonce(&admin));
+        let vnonce = client.get_nonce(&verifier);
+        client.flag_credit(
+            &verifier,
+            &ids.get(0).unwrap(),
+            &String::from_str(&env, "test flag"),
+            &vnonce,
+        );
+        assert_eq!(client.get_credit_count(), 3);
+    }
+
+    #[test]
+    fn test_get_credits_by_owner_paginated() {
+        let (env, client, admin, _) = setup();
+        let issuer = Address::generate(&env);
+        client.register_issuer(&admin, &issuer, &client.get_nonce(&admin));
+        client.register_methodology(
+            &admin,
+            &String::from_str(&env, "VCS"),
+            &String::from_str(&env, "Verified Carbon Standard"),
+            &client.get_nonce(&admin),
+        );
+        client.register_project(
+            &admin,
+            &String::from_str(&env, "PROJ-PAGE"),
+            &String::from_str(&env, "Test Project"),
+            &String::from_str(&env, "A test project"),
+            &String::from_str(&env, "NG"),
+        );
+
+        let mut ids = soroban_sdk::Vec::new(&env);
+        for year in 2015u32..2020u32 {
+            let nonce = client.get_nonce(&issuer);
+            let id = client.submit_credit(
+                &issuer,
+                &String::from_str(&env, "PROJ-PAGE"),
+                &year,
+                &String::from_str(&env, "VCS"),
+                &String::from_str(&env, "NG"),
+                &1_000_000,
+                &String::from_str(&env, "bafybei123"),
+                &nonce,
+            );
+            ids.push_back(id);
+        }
+
+        let page0 = client.get_credits_by_owner_paginated(&issuer, &0, &2);
+        assert_eq!(page0.len(), 2);
+        assert_eq!(page0.get(0).unwrap(), ids.get(0).unwrap());
+        assert_eq!(page0.get(1).unwrap(), ids.get(1).unwrap());
+
+        let page1 = client.get_credits_by_owner_paginated(&issuer, &2, &2);
+        assert_eq!(page1.len(), 2);
+        assert_eq!(page1.get(0).unwrap(), ids.get(2).unwrap());
+
+        let last_page = client.get_credits_by_owner_paginated(&issuer, &4, &2);
+        assert_eq!(last_page.len(), 1);
+        assert_eq!(last_page.get(0).unwrap(), ids.get(4).unwrap());
+
+        let past_end = client.get_credits_by_owner_paginated(&issuer, &10, &2);
+        assert_eq!(past_end.len(), 0);
+    }
+
+    #[test]
+    fn test_get_credits_by_owner_paginated_excludes_transferred_credits() {
+        let (env, client, admin, _) = setup();
+        let issuer = Address::generate(&env);
+        let id = submit_test_credit(&env, &client, &admin, &issuer);
+
+        let recipient = Address::generate(&env);
+        let nonce = client.get_nonce(&issuer);
+        client.transfer_credit(&issuer, &recipient, &id, &nonce);
+
+        let issuer_page = client.get_credits_by_owner_paginated(&issuer, &0, &10);
+        assert_eq!(issuer_page.len(), 0);
+
+        let recipient_page = client.get_credits_by_owner_paginated(&recipient, &0, &10);
+        assert_eq!(recipient_page.len(), 1);
+        assert_eq!(recipient_page.get(0).unwrap(), id);
     }
 
     #[test]

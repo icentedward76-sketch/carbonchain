@@ -1,6 +1,7 @@
 import { Component, inject } from '@angular/core';
 import { RouterOutlet, RouterLink } from '@angular/router';
 import { ConnectWalletComponent } from './core/components/connect-wallet.component';
+import { NetworkIndicatorComponent } from './core/components/network-indicator.component';
 import { LocaleSwitcherComponent } from './core/components/locale-switcher.component';
 import { ThemeService } from './core/services/theme.service';
 import { TranslatePipe } from './core/pipes/translate.pipe';
@@ -14,6 +15,7 @@ import { OnlineStatusService } from './core/services/online-status.service';
     RouterOutlet,
     RouterLink,
     ConnectWalletComponent,
+    NetworkIndicatorComponent,
     LocaleSwitcherComponent,
     TranslatePipe,
     ToastComponent,

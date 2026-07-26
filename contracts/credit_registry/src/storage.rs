@@ -372,6 +372,26 @@ pub fn get_credits_by_owner(env: &Env, owner: &Address) -> Vec<BytesN<32>> {
         .unwrap_or_else(|| Vec::new(env))
 }
 
+// ── Total credit count ──────────────────────────────────────────────────────
+
+/// Returns the total number of credits ever submitted (see `DataKey::TotalCredits`).
+pub fn get_total_credits(env: &Env) -> u64 {
+    env.storage()
+        .instance()
+        .get(&DataKey::TotalCredits)
+        .unwrap_or(0u64)
+}
+
+/// Increments the global total-credits counter. Call exactly once per
+/// `submit_credit`. Never call a corresponding decrement — the counter
+/// tracks credits ever issued, not credits currently active.
+pub fn increment_total_credits(env: &Env) {
+    let count = get_total_credits(env);
+    env.storage()
+        .instance()
+        .set(&DataKey::TotalCredits, &(count + 1));
+}
+
 /// Remove a single credit ID from the per-owner index.
 ///
 /// Issue #470: `transfer_credit` and `split_credit` did not remove the credit
